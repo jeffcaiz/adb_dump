@@ -35,9 +35,27 @@ Every subcommand has its own `-h` with the options that apply to it.
 --root M           auto|none|adbroot|su|custom        (default auto)
 --push-bin FILE    push a static busybox/helper for thin devices
 --skip NAME        skip an extra partition (repeatable)
---no-freeze        dump/ubidump: read live, don't freeze UBI writers
+--freeze MODE      rw-UBI consistency: stop|kill|live   (default stop, see below)
 --no-ubinize       dump/ubidump: keep .ubifs + repack kit, don't build the .ubi
 ```
+
+### rw-UBI consistency (`--freeze`)
+
+A live read-write UBIFS can change under a long whole-volume read (journal commit,
+GC), tearing the image so it won't parse. `--freeze` picks how hard to quiesce it:
+
+| `--freeze` | what it does | consistency | cost |
+|---|---|---|---|
+| `stop` *(default)* | reversible `kill -STOP` + `sync` | best-effort (can't stop kernel commit/GC) — md5-verify catches tearing | reversible, no reboot |
+| `kill` | kill the writers, then `mount -o remount,ro` | clean image | **destructive** — services die; **auto-`adb reboot` after a clean dump** |
+| `live` | nothing | none | reads a moving target |
+
+The default `stop` flushes (`sync`) and pauses the userspace writers reversibly, then
+reads; the device-vs-host md5 check flags any residual tearing. If a volume is busy
+enough that `stop` keeps producing md5 mismatches, escalate to `--freeze kill` — it
+**kills the writers and remounts the fs read-only** for a guaranteed-consistent image,
+then **`adb reboot`s the device** (only on a clean run) to restore the killed
+services. Read-only volumes need no quiescing regardless.
 
 ## Output
 
@@ -46,8 +64,12 @@ Images land in `./out` (change with `-o`):
 - **MTD partitions** → `<name>.bin`, md5-verified device-side vs host-side.
 - **UBI volumes** → a flashable `<mtdname>.ubi`. If the host has no `ubinize`
   (mtd-utils), you instead get a self-contained *repack kit* (`.ubifs` + geometry +
-  `repack.sh`) to build the `.ubi` later. Extract contents with
-  `ubireader_extract_files <vol>.ubi`; flash with `ubiformat /dev/mtdN -f <mtdname>.ubi`.
+  `repack.sh`) to build the `.ubi` later. Flash with `ubiformat /dev/mtdN -f <mtdname>.ubi`.
+
+To read a `.ubi`'s contents on the host, `tools/ubimount.sh` mounts it read-only
+through the real kernel UBI/UBIFS stack (`sudo ./tools/ubimount.sh -x <vol>.ubi dest/`)
+— authoritative, and it works on images that `ubireader` fails to parse. See
+[TECHNICAL.md](TECHNICAL.md#reading--extracting-a-dumped-ubi).
 
 ## Safety
 

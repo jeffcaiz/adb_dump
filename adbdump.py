@@ -416,6 +416,17 @@ class Device:
                 res[mnt] = re.findall(r'(\d+)\(([^)]*)\)', procs)
         return res
 
+    def rw_ubifs_mounts(self):
+        """-> list of rw-mounted ubifs mountpoints."""
+        raw = self.shtext(r'''awk '$3=="ubifs" && $4 ~ /(^|,)rw(,|$)/ {print $2}' /proc/mounts 2>/dev/null''') or ''
+        return [m for m in raw.split() if m]
+
+    def remount(self, mnt, mode):
+        """remount mnt 'ro' or 'rw'. -> True iff /proc/mounts confirms `mode` after."""
+        self.shtext(f"mount -o remount,{mode} {mnt}")
+        raw = self.shtext(f"awk -v m={mnt} '$2==m {{print $4}}' /proc/mounts 2>/dev/null") or ''
+        return mode in raw.split(',')
+
 
 # ------------------------------------------------------------------ inventory ---
 def host_md5(path):
@@ -666,16 +677,17 @@ def make_flashable(a, sec, dumped):
         info(f"  not packed here — rebuild later: cd {a.out} && ./repack.sh")
 
 def collect_writers(dev, a):
-    """Resolve the pids to freeze. -> (sorted pid list, auto_bool).
-    auto: walk /proc for rw-ubifs writers; named: pidof each --freeze NAME."""
+    """Resolve the writer pids. -> (sorted pid list, auto_bool).
+    auto: walk /proc for rw-ubifs writers; named: pidof each --writers NAME."""
+    names = getattr(a, 'writers', None)
     frozen = []
-    auto = a.freeze in (None, [], ['auto'])
+    auto = names in (None, [], ['auto'])
     if auto:
         for mnt, ps in dev.scan_writers().items():
             info(f"  writers of {mnt}: " + (', '.join(f"{c}({p})" for p, c in ps) or '(none)'))
             frozen += [p for p, _ in ps]
     else:
-        for name in a.freeze:
+        for name in names:
             frozen += re.findall(r'\d+', dev.shtext(f"pidof {name} 2>/dev/null") or '')
     return sorted(set(frozen), key=int), auto
 
@@ -690,7 +702,7 @@ def cmd_freezehold(dev, a):
     setup(dev, a)
     frozen, auto = collect_writers(dev, a)
     if not frozen:
-        err("No writers to freeze — nothing to test (try --freeze NAME)."); sys.exit(1)
+        err("No writers to freeze — nothing to test (try --writers NAME)."); sys.exit(1)
 
     def uptime():
         t = (dev.shtext("cat /proc/uptime 2>/dev/null") or '').split()
@@ -757,19 +769,47 @@ def cmd_freezehold(dev, a):
     sys.exit(0)
 
 def dump_ubi_volumes(dev, a, vols, sec, only_names=None):
-    """Freeze writers (default; --no-freeze opts out) then dump /dev/ubiX_Y. Returns fail count."""
-    frozen = []
-    if a.no_freeze:
-        warn("  --no-freeze: reading live rw volume(s); image may be inconsistent / md5 may differ")
-    else:
+    """Quiesce the rw ubifs, then dump /dev/ubiX_Y. Returns fail count.
+
+    Mode is --freeze:
+      stop  (default): reversible kill -STOP + sync (no kill/remount) — best-effort:
+                       can't stop the kernel commit/GC thread, so a long read of a
+                       busy volume may still tear (md5-verify catches it).
+      kill           : kill the writers so they release the mount, then
+                       `mount -o remount,ro` it — genuinely stops ubifs (commit +
+                       no bgt/GC), so the read can't tear. DESTRUCTIVE: services are
+                       killed and not restarted; caller auto-reboots on a clean run.
+      live           : read live, touch nothing."""
+    ro_mounts = []   # remounted ro by us -> restore rw in finally
+    frozen = []      # --freeze stop: STOPped pids -> CONT in finally
+    killed = False   # did we kill writers? (caller decides whether to auto-reboot)
+    fail = 0
+    if a.freeze == 'live':
+        warn("  --freeze live: reading live rw volume(s); image may be inconsistent / md5 may differ")
+    elif a.freeze == 'stop':
         frozen, auto = collect_writers(dev, a)
         if frozen:
-            info(f"  freezing {len(frozen)} writer(s) [{'auto' if auto else 'named'}]: {' '.join(frozen)}"
-                 f"   {C['B']}(--no-freeze to read live){C['Z']}")
+            info(f"  --freeze stop: kill -STOP {len(frozen)} writer(s): {' '.join(frozen)}"
+                 f"   {C['B']}(reversible, best-effort){C['Z']}")
             dev.shtext(f"kill -STOP {' '.join(frozen)}; sync")
         elif auto:
             info("  no rw-volume writers to freeze (read-only volumes)")
-    fail = 0; dumped = set()
+    else:   # 'kill': consistent but destructive (opt-in)
+        writers, _ = collect_writers(dev, a)
+        if writers:
+            warn(f"  killing {len(writers)} writer(s) for a consistent image: {' '.join(writers)}"
+                 f"   {C['B']}(reboot to restore; --freeze stop=reversible, --freeze live=read live){C['Z']}")
+            dev.shtext(f"kill -9 {' '.join(writers)}"); killed = True; time.sleep(1)
+            still = [p for ps in dev.scan_writers().values() for p, _ in ps]
+            if still:   # respawned (procd/systemd) -> one more swing before remount
+                dev.shtext(f"kill -9 {' '.join(still)}"); time.sleep(1)
+        for mnt in dev.rw_ubifs_mounts():
+            if dev.remount(mnt, 'ro'):
+                ro_mounts.append(mnt); info(f"  remounted ro: {mnt}")
+            else:
+                warn(f"  could NOT remount {mnt} ro (writer respawned?) — its image may be inconsistent")
+                fail = 1   # not a clean quiesce -> counts as "not smooth" (blocks auto-reboot)
+    dumped = set()
     try:
         for v in vols:
             nm = os.path.basename(v)
@@ -783,16 +823,33 @@ def dump_ubi_volumes(dev, a, vols, sec, only_names=None):
             if a.verify:
                 dh, hh = dev.dev_md5(v), host_md5(out)
                 if dh and dh == hh: ok(f"   md5 OK  {hh}  ({hsize(got)})"); dumped.add(nm)
-                else: warn(f"   md5 MISMATCH dev={dh} host={hh} (live writes? use default freeze)"); fail = 1
+                else: warn(f"   md5 MISMATCH dev={dh} host={hh} (live writes? still inconsistent)"); fail = 1
             else:
                 ok(f"   wrote {hsize(got)}"); dumped.add(nm)
     finally:
+        for mnt in ro_mounts:
+            dev.remount(mnt, 'rw')
+        if ro_mounts:
+            info(f"  restored rw: {' '.join(ro_mounts)}")
         if frozen:
             dev.shtext(f"kill -CONT {' '.join(frozen)}")
             info(f"  thawed: {' '.join(frozen)}")
     if dumped:
         make_flashable(a, sec, dumped)
-    return fail
+    return fail, killed
+
+def reboot_after_kill(dev, killed, fail):
+    """We kill writers to get a consistent image; that's destructive, so restore the
+    device by rebooting once the dump is done — but ONLY on a clean run. If anything
+    went wrong (fail), stop and leave it up so the user can inspect."""
+    if not killed:
+        return
+    if fail:
+        warn("Writers were killed but the run had warnings — NOT rebooting. "
+             "Inspect the output, then `adb reboot` manually to restore services.")
+    else:
+        warn("Writers were killed for a consistent image — rebooting to restore services…")
+        dev.adb('reboot')
 
 def cmd_dump(dev, a):
     parts, umtds, sclass, sec = inventory(dev, a)
@@ -824,7 +881,7 @@ def cmd_dump(dev, a):
                 continue
         sel.append((d, sz, nm))
 
-    fail = 0
+    fail = 0; killed = False
     for d, sz, nm in sel:
         rc = dump_one_mtd(dev, a, d, sz, nm)
         if rc == 2:
@@ -835,13 +892,15 @@ def cmd_dump(dev, a):
     if not want and umtds:
         vols = ubi_vols_from_sec(sec)
         if vols:
-            hr(); info(f"{C['B']}active UBI -> ubidump ({len(vols)} volume(s), freezing writers){C['Z']}")
-            fail |= dump_ubi_volumes(dev, a, vols, sec)
+            hr(); info(f"{C['B']}active UBI -> ubidump ({len(vols)} volume(s), quiescing writers){C['Z']}")
+            f2, killed = dump_ubi_volumes(dev, a, vols, sec)
+            fail |= f2
 
     if not sel and not (not want and umtds):
         err("Nothing to dump (check names / skip list)."); sys.exit(1)
     hr()
     (ok if not fail else warn)(f"DONE{'' if not fail else ' with warnings'} -> {a.out}")
+    reboot_after_kill(dev, killed, fail)
     sys.exit(fail)
 
 def cmd_ubidump(dev, a):
@@ -851,10 +910,11 @@ def cmd_ubidump(dev, a):
     vols = ubi_vols_from_sec(sec)
     if not vols:
         err("No UBI volumes (/dev/ubiX_Y)."); sys.exit(1)
-    fail = dump_ubi_volumes(dev, a, vols, sec, only_names=a.names or None)
+    fail, killed = dump_ubi_volumes(dev, a, vols, sec, only_names=a.names or None)
     hr()
     (ok if not fail else warn)(f"DONE -> {a.out}")
     info(f"Extract on host:  ubireader_extract_files {a.out}/<vol>.ubi   (or <vol>.ubifs if kept)")
+    reboot_after_kill(dev, killed, fail)
     sys.exit(fail)
 
 # ---------------------------------------------------------------------- main ---
@@ -872,13 +932,16 @@ def main():
     common.add_argument('--allow-corrupt', dest='allow_corrupt', action='store_true', help='permit binary-unsafe raw PTY transport')
 
     freezeopt = argparse.ArgumentParser(add_help=False)        # dump / ubidump / freezehold
-    freezeopt.add_argument('--freeze', nargs='*', help='process names to STOP (default: auto-detect writers)')
+    freezeopt.add_argument('--writers', nargs='*', help='target these writer process names instead of auto-detecting')
 
     readopts = argparse.ArgumentParser(add_help=False)         # dump / ubidump (write files, verify, freeze, ubinize)
     readopts.add_argument('-o', '--out', default='out')
     readopts.add_argument('--dd-timeout', dest='dd_timeout', type=int, default=1800)
     readopts.add_argument('--no-verify', dest='verify', action='store_false')
-    readopts.add_argument('--no-freeze', dest='no_freeze', action='store_true', help='read live, do NOT freeze writers')
+    readopts.add_argument('--freeze', choices=['kill', 'stop', 'live'], default='stop',
+                          help="rw-UBI consistency: stop=reversible kill -STOP + sync (best-effort, "
+                               "md5 catches tearing); kill=kill writers + remount ro (consistent but "
+                               "destructive -> auto-reboot on success); live=read live  (default: stop)")
     readopts.add_argument('--no-ubinize', dest='no_ubinize', action='store_true', help='keep only .ubifs, do NOT build flashable .ubi')
     readopts.add_argument('--keep-ubifs', dest='keep_ubifs', action='store_true', help='keep the .ubifs after building .ubi (default: remove the duplicate)')
 

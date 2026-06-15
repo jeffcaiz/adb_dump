@@ -53,13 +53,46 @@ raw-read. In **full-auto `dump`** (no names) they're **auto-converted to a `ubid
 (`dump system`), it's **refused with a report** — you opted into a specific
 partition, so the tool won't silently do something else.
 
-### Consistent UBI image
+### Consistent UBI image (`--freeze`)
 
-Live rw ubifs has an uncommitted journal → `ubireader` chokes / md5 won't match. So
-`ubidump` **freezes writers by default**: it detects the writer processes dynamically
-(scans `/proc/*/fd` for the rw mountpoint), `kill -STOP`s them, `sync`, reads
-`/dev/ubiX_Y`, `kill -CONT`. Override with `--freeze name1 name2` (specific procs) or
-`--no-freeze` (read live). Read-only volumes have no writers → freeze is a no-op.
+A whole-volume read of `/dev/ubiX_Y` is **not atomic** — it takes seconds to minutes.
+A live rw UBIFS changes underneath it the whole time, and not only from userspace:
+
+- the **UBIFS background commit thread** (`ubifs_bgt`) commits the journal on a timer
+  even with zero userspace writers, and **GC** rewrites LEBs internally;
+- so the early LEBs come from before a commit and the later ones from after → a
+  **torn image** whose wandering-tree index points at nodes that aren't where the
+  copy says → `ubireader` fails ("Node size smaller than expected" / "Bad Read
+  Offset"). md5 (a second whole read) catches *drift between two reads* but can't
+  prove a single read was internally atomic.
+
+`kill -STOP`-ing the userspace writers (the default) doesn't stop the kernel
+commit/GC thread, so it's only best-effort — but it's reversible and harmless, and
+the device-vs-host md5 check flags a torn read. The only way to *guarantee* a clean
+image is to make the filesystem genuinely read-only — but `mount -o remount,ro`
+returns `EBUSY` while any file is open for write, and `kill -STOP` doesn't close fds.
+So the `kill` mode **kills** the writers (fds close), after which `remount,ro`
+succeeds and UBIFS stops writing entirely. That's destructive (services don't come
+back) so it's opt-in, not the default — in practice many rw volumes barely change and
+`stop` produces a matching md5.
+
+`--freeze` modes (detector: scans `/proc/*/fd` for the rw mountpoint; `--writers
+NAME…` overrides it):
+
+| mode | mechanism | consistency | reversible |
+|---|---|---|---|
+| `stop` *(default)* | `kill -STOP` writers + `sync` → read → `kill -CONT` | best-effort (kernel commit/GC still runs); md5-verify catches tearing | yes |
+| `kill` | `kill -9` writers → `mount -o remount,ro` → read → `remount,rw` | clean | no — services killed; auto-`adb reboot` on a clean run |
+| `live` | nothing | none | n/a |
+
+In `kill` mode, if a writer respawns (procd/systemd) before the remount, it swings
+once more, then verifies the mount actually went `ro` in `/proc/mounts`; a mount it
+can't quiesce is flagged and counts as "not clean" (which blocks the auto-reboot).
+Read-only volumes have no writers → all modes are a no-op for them.
+
+`fsfreeze` (FIFREEZE) would be the textbook primitive (it quiesces with files still
+open), but busybox usually lacks it and UBIFS freeze support is uncertain, so it's
+not used.
 
 ## UBI output: flashable, or a self-contained repack kit
 
@@ -93,6 +126,31 @@ boot), not data stored in a normal partition:
 | —    | LEB  | `ubi<N>/eraseblock_size` | usable bytes/block after UBI's EC+VID headers; UBI-computed |
 
 `vol_size` in the cfg is `reserved_ebs × LEB`.
+
+### Reading / extracting a dumped .ubi
+
+To read the contents back on the host there are two paths:
+
+- **`ubireader`** (`ubireader_extract_files <vol>.ubi`) — userspace, no root, but it's
+  a third-party reimplementation of the UBIFS parser and **0.8.x throws false
+  failures** on some valid images (e.g. `Bad Read Offset Request` / `Node size smaller
+  than expected`, 0 files), so a failure here does **not** mean the dump is bad.
+- **Kernel mount** (authoritative) — `tools/ubimount.sh` feeds the image to the real
+  kernel UBI/UBIFS stack via `nandsim` and mounts it read-only:
+
+  ```sh
+  sudo ./tools/ubimount.sh out/data.ubi            # mount ro at /mnt/ubi
+  sudo ./tools/ubimount.sh -x out/data.ubi dest/   # copy all contents out, then clean up
+  sudo ./tools/ubimount.sh -u                       # unmount + detach + unload
+  ```
+
+  UBIFS isn't a block fs — you can't `mount -o loop` it — so the script recreates the
+  MTD→UBI→UBIFS stack: `nandsim` (2K page / 128K block, matching the device) →
+  `flash_erase` (so empty PEBs read as clean `0xFF`) → `ubiformat -f` → `ubiattach -O
+  2048` (the device has `subpagesize==pagesize`, so the VID header sits at 2048 and
+  data at 4096) → `mount -t ubifs -o ro`. Needs root + mtd-utils + the stock
+  nandsim/ubi/ubifs modules. Verified: both `data` and `system` dumps mount and read
+  back every file cleanly this way.
 
 ## `freezehold` — freeze/thaw diagnostic
 
