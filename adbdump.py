@@ -42,7 +42,10 @@ echo "SOC_ID=$(cat /sys/devices/soc0/soc_id 2>/dev/null)"
 echo "SOC_HW=$(cat /sys/devices/soc0/hw_platform 2>/dev/null)"
 echo "MTDTYPES=$(cat /sys/class/mtd/mtd[0-9]*/type 2>/dev/null | sort -u | tr '\n' ',')"
 echo "HASMTD=$(test -e /proc/mtd && echo 1)"
-echo "BLK=$(for d in /dev/mmcblk0 /dev/sda /dev/nvme0n1; do [ -e $d ] && echo ${d##*/}; done | tr '\n' ' ')"
+# Enumerate real disks from /sys/block, which is independent of the /dev layout
+# (Android puts nodes under /dev/block/, not flat /dev/, so probing /dev/sda misses
+# UFS/SCSI). /sys/block lists base disks only (sda, mmcblk0), never partitions.
+echo "BLK=$(for d in /sys/block/mmcblk[0-9] /sys/block/sd[a-z] /sys/block/nvme[0-9]*n[0-9]*; do [ -e "$d" ] && echo ${d##*/}; done | tr '\n' ' ')"
 echo "MMC_TYPE=$(cat /sys/block/mmcblk0/device/type 2>/dev/null)"
 echo "EMMC_SPECIAL=$(for d in /dev/mmcblk0boot0 /dev/mmcblk0boot1 /dev/mmcblk0rpmb /dev/mmcblk0gp0; do [ -e $d ] && echo ${d##*/}; done | tr '\n' ' ')"
 echo "IDU=$(id -u)"
@@ -174,6 +177,12 @@ def dump_plan(name, sclass, is_ubi=False, skip_globs=()):
         return Plan('SKIP', 'UBI filesystem', 'ubi', 'via ubidump')
     if 'rpmb' in name.lower():
         return Plan('SKIP', role, 'rpmb', 'needs RPMB protocol')
+    # On block storage the user data fs is mounted, rw and large: a raw block image
+    # is huge, torn by live writes, and under FBE/FDE just ciphertext. Skip it by
+    # default and steer to --files (a file-level tar of the mountpoint, which root
+    # reads decrypted). Still dumpable raw when named explicitly without --files.
+    if sclass.endswith('-block') and re.fullmatch(r'userdata|data', name.lower()):
+        return Plan('SKIP', role, 'live-fs', 'live rw user fs — capture with --files (raw image is huge/torn/encrypted)')
     if nand and not nand_safe:
         return Plan('SKIP', role, 'nand-unsafe', 'unsafe to raw-read on NAND (special region / controller contention)')
     return Plan('OK', role, None, '')
@@ -298,6 +307,14 @@ class Device:
             self.root = 'none'; return
         if self.root in ('none', 'su', 'custom'):
             return
+        # auto: try su (Magisk; non-disruptive) BEFORE `adb root`. On production /
+        # Magisk builds `adb root` is refused AND tears down the current adb
+        # transport (next command returns "error: closed", and a USB re-enumeration
+        # can even drop the device to `unauthorized`), so probing su first avoids
+        # corrupting the rest of this run when su is what's actually available.
+        if is_root_uid(self.shtext("su -c 'id -u'", root=False)):
+            self.root = 'su'; return
+        # Fall back to the disruptive adbd-root path (eng / userdebug builds).
         self.adb('root'); self.adb('wait-for-device', timeout=30)
         if is_root_uid(self.shtext('id -u', root=False)):
             self.root = 'none'; return
@@ -567,6 +584,18 @@ class Device:
                 res[mnt] = re.findall(r'(\d+)\(([^)]*)\)', procs)
         return res
 
+    def block_mounts(self):
+        """-> {device_path: mountpoint} for block-backed mounts. First mount per
+        device wins, so a partition maps to its real mountpoint (e.g.
+        /dev/block/sda17 -> /data) rather than a later bind (/data/user/0)."""
+        raw = self.shtext('cat /proc/mounts 2>/dev/null') or ''
+        res = {}
+        for ln in raw.splitlines():
+            t = ln.split()
+            if len(t) >= 2 and t[0].startswith('/dev/') and t[0] not in res:
+                res[t[0]] = t[1]
+        return res
+
     def rw_ubifs_mounts(self):
         """-> list of rw-mounted ubifs mountpoints."""
         raw = self.shtext(r'''awk '$3=="ubifs" && $4 ~ /(^|,)rw(,|$)/ {print $2}' /proc/mounts 2>/dev/null''') or ''
@@ -603,15 +632,31 @@ def parse_mtd(sec):
             out.append((path, int(m.group(2), 16), m.group(4)))
     return out
 
+WHOLE_DISK = re.compile(r'/dev/block/(sd[a-z]+|mmcblk\d+|nvme\d+n\d+)$')
 def parse_block(sec):
-    """eMMC/UFS block partitions from /dev/block(/bootdevice)/by-name + boot HW parts."""
-    seen = set(); out = []
+    """eMMC/UFS block partitions from /dev/block(/bootdevice)/by-name + boot HW parts.
+
+    Some devices (seen on OnePlus 6T) carry by-name links to the whole LUN/disk
+    (.../by-name/sda -> /dev/block/sda) alongside the real partitions. A whole disk
+    just re-contains every partition under it, so dumping it duplicates the lot
+    (sda = 116GB = all of sda1..sda17). Drop a whole-disk target, but ONLY when a
+    partition of it is also enumerated — so a partition-table-less raw disk that is
+    itself the only node is still kept."""
+    rows = []
     for ln in sec.get('BLOCK', []):
         t = ln.split()
-        if len(t) < 3 or t[1] in seen:
+        if len(t) >= 3:
+            rows.append((t[0], t[1], int(t[2] or 0) * 512))
+    targets = {dev for _, dev, _ in rows}
+    def redundant_disk(dev):
+        return bool(WHOLE_DISK.fullmatch(dev)) and any(
+            o != dev and o.startswith(dev) and re.match(r'p?\d', o[len(dev):]) for o in targets)
+    seen = set(); out = []
+    for name, dev, size in rows:
+        if dev in seen or redundant_disk(dev):
             continue
-        seen.add(t[1])
-        out.append((t[1], int(t[2] or 0) * 512, t[0]))
+        seen.add(dev)
+        out.append((dev, size, name))
     return out
 
 def ubi_mtds(sec):
@@ -1117,6 +1162,22 @@ def reboot_after_kill(dev, killed, fail):
         warn("Writers were killed for a consistent image — rebooting to restore services…")
         dev.adb('reboot')
 
+def tar_capture(dev, a, nm, mnt):
+    """Capture a mounted fs at file level: a (gzipped) tar of the mountpoint subtree.
+    For a live rw filesystem (e.g. userdata) where a raw block image is huge, torn by
+    live writes, and—under FBE/FDE—ciphertext; root walks the tree decrypted. The
+    tar is live best-effort (per-file/cross-file skew only, no whole-image tear)."""
+    ext = '.tar.gz' if dev.gzip else '.tar'
+    out = os.path.join(a.out, nm + ext)
+    sm = dev.submounts(mnt)
+    info(f">> {nm}  (files: {mnt})  ->  {out}")
+    if sm:
+        warn(f"   note: submount(s) under {mnt}: {' '.join(sm)} — tar descends into them")
+    if not dev.stream_cmd(dev._tar_producer(mnt), out, a.dd_timeout, compressed=True):
+        err("   transport error"); return 1
+    ok(f"   wrote {hsize(os.path.getsize(out))}  {C['B']}(file-level; live best-effort){C['Z']}")
+    return 0
+
 def cmd_dump(dev, a):
     parts, umtds, sclass, sec = inventory(dev, a)
     os.makedirs(a.out, exist_ok=True)
@@ -1124,27 +1185,46 @@ def cmd_dump(dev, a):
          f"root={C['B']}{dev.root}{C['Z']}  out={C['B']}{a.out}{C['Z']}")
     skip_globs = (a.skip_list.split() if a.skip_list is not None else []) + (a.skip or [])
     want = a.names
+    blk_mounts = dev.block_mounts() if sclass.endswith('-block') else {}
 
-    sel = []
+    sel = []; filecaps = []
     for d, sz, nm in parts:
         is_ubi = is_ubi_backed(d, umtds)
         p = dump_plan(nm, sclass, is_ubi, skip_globs)
-        if want:
-            if nm not in want and d not in want:
-                continue
-            if p.action == 'SKIP':   # explicitly named, but not readable here -> report & stop
+        named = nm in want or d in want
+        if want and not named:
+            continue
+        mnt = blk_mounts.get(d)
+        # --files: capture a mounted fs at file level (tar the decrypted mountpoint)
+        # instead of a raw block image — for any mounted volume (mirrors ubidump).
+        # Unmounted volumes have no fs to tar, so they fall through to a block image.
+        if a.files and mnt and p.reason in (None, 'live-fs'):
+            filecaps.append((nm, mnt)); continue
+        # A live mounted user fs (userdata) without --files: skip the raw image by
+        # default and steer to --files. Naming it with --force opts back into a raw
+        # block image (md5 will likely differ — it's read live).
+        if p.reason == 'live-fs':
+            if named and a.force:
+                sel.append((d, sz, nm)); continue
+            if named:
+                warn(f">> {nm} ({d}): SKIP — {p.note}.")
+                if mnt:
+                    warn(f"   Capture the live files with: adbdump.py dump {nm} --files")
+                warn(f"   (or force a raw block image with: adbdump.py dump {nm} --force)")
+            else:
+                info(f"SKIP {nm}  ({p.role}, {p.note})")
+            continue
+        if p.action == 'SKIP':
+            if want and named:   # explicitly named, but not readable here -> report & stop
                 warn(f">> {nm} ({d}): SKIP — {p.role}, {p.note}.")
                 hint = {
                     'ubi':       'Capture it with: adbdump.py ubidump',
                     'skip-list': 'Remove it from --skip / --skip-list to dump it.',
                 }.get(p.reason, f'Auto-skipped ({p.role}); a raw read is unsafe and not done here.')
                 warn(f"   {hint}")
-                continue
-        else:
-            if p.action == 'SKIP':   # full-auto: UBI handled below; others just skipped
-                if not is_ubi:
-                    info(f"SKIP {nm}  ({p.role}, {p.note})")
-                continue
+            elif not is_ubi:     # full-auto: UBI handled below; others just noted
+                info(f"SKIP {nm}  ({p.role}, {p.note})")
+            continue
         sel.append((d, sz, nm))
 
     fail = 0; killed = False
@@ -1153,6 +1233,8 @@ def cmd_dump(dev, a):
         if rc == 2:
             sys.exit(2)
         fail |= rc
+    for nm, mnt in filecaps:
+        fail |= tar_capture(dev, a, nm, mnt)
 
     # full-auto: active UBI partitions were skipped above -> auto-convert to ubidump
     if not want and umtds:
@@ -1162,7 +1244,7 @@ def cmd_dump(dev, a):
             f2, killed = dump_ubi_volumes(dev, a, vols, sec)
             fail |= f2
 
-    if not sel and not (not want and umtds):
+    if not sel and not filecaps and not (not want and umtds):
         err("Nothing to dump (check names / skip list)."); sys.exit(1)
     hr()
     (ok if not fail else warn)(f"DONE{'' if not fail else ' with warnings'} -> {a.out}")
@@ -1219,9 +1301,12 @@ def main():
                                "consistency window for retry to help; cap it to one retry and steer "
                                "to --files (default 180)")
     readopts.add_argument('--files', action='store_true',
-                          help="capture mounted ubifs volumes as a file-level tar(.gz) instead of a "
-                               "block image — for busy rw volumes (e.g. userdata) where a torn block "
-                               "image can corrupt the whole ubifs; unmounted volumes still get a block image")
+                          help="capture a mounted rw filesystem as a file-level tar(.gz) of its "
+                               "mountpoint instead of a block image — for busy/large volumes (e.g. "
+                               "userdata) where a raw image is torn by live writes and, under "
+                               "FBE/FDE, just ciphertext; root reads the tree decrypted. On UBI a "
+                               "torn block image can corrupt the whole ubifs; unmounted volumes "
+                               "still get a block image")
     readopts.add_argument('--no-ubinize', dest='no_ubinize', action='store_true', help='keep only .ubifs, do NOT build flashable .ubi')
     readopts.add_argument('--keep-ubifs', dest='keep_ubifs', action='store_true', help='keep the .ubifs after building .ubi (default: remove the duplicate)')
 

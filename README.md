@@ -37,7 +37,7 @@ Every subcommand has its own `-h` with the options that apply to it.
 --skip NAME        skip an extra partition (repeatable)
 --freeze MODE      rw-UBI consistency: stop|kill|live   (default stop, see below)
 --retry N          re-read a volume on md5 mismatch (default 2; md5 OK = consistent)
---files            capture mounted ubifs as a file-level tar.gz (busy rw volumes)
+--files            capture a mounted fs as a file-level tar.gz (busy/large/encrypted rw volumes)
 --no-ubinize       dump/ubidump: keep .ubifs + repack kit, don't build the .ubi
 ```
 
@@ -64,19 +64,29 @@ busy enough that retries keep mismatching, escalate to `--freeze kill` — it
 then **`adb reboot`s the device** (only on a clean run) to restore the killed
 services. Read-only volumes need no quiescing regardless.
 
-### Big busy volumes that won't go consistent (`--files`)
+### Big busy / encrypted volumes (`--files`)
 
-On some devices `--freeze kill` just reboots (killing the framework is fatal) and
-`stop` can't pin a huge live `/data`. A torn **block** image of UBIFS can be
-unmountable entirely (its index/master are smeared across time, unlike an atomic
-power-cut). For these, `ubidump --files <vol>` captures a **file-level `tar.gz` of the
-mountpoint** instead — read through the live kernel, so the worst case is a single
-mid-write file or cross-file skew, never a dead image. Unmounted volumes (firmware/NV)
-still get a block image. On an md5 mismatch the tool suggests this automatically.
+A huge live rw filesystem (e.g. `userdata`/`/data`) is a poor fit for a raw block
+image three ways: it's enormous, it tears under a long read (live writes), and on a
+modern phone it's **encrypted** (FBE/FDE) so the raw image is just ciphertext. On UBI
+a torn block image of UBIFS can be unmountable entirely (its index/master are smeared
+across time, unlike an atomic power-cut).
+
+`--files` sidesteps all three: it captures a **`tar`(`.gz`) of the mountpoint** —
+read through the live kernel, which under root serves the files **decrypted**, so the
+worst case is a single mid-write file or cross-file skew, never a dead or ciphertext
+image. Any mounted volume can be captured this way; unmounted volumes (firmware/NV)
+still get a block image.
+
+On **block** storage `userdata`/`data` is **skipped by default** in full-auto `dump`
+(a 110 GB encrypted, live raw image is rarely what you want) and you're steered to
+`--files`; on UBI an md5 mismatch suggests it automatically.
 
 ```
-./adbdump.py ubidump --files ubi0_userdata      # -> out/ubi0_userdata.tar.gz
-tar -xzf out/ubi0_userdata.tar.gz -C userdata/  # unpack on host
+./adbdump.py dump userdata --files              # block: -> out/userdata.tar.gz (decrypted files)
+./adbdump.py dump userdata --force              # block: force a raw block image anyway (md5 will drift)
+./adbdump.py ubidump --files ubi0_userdata      # UBI:   -> out/ubi0_userdata.tar.gz
+tar -xzf out/userdata.tar.gz -C userdata/       # unpack on host
 ```
 
 ## Output
@@ -99,6 +109,9 @@ through the real kernel UBI/UBIFS stack (`sudo ./tools/ubimount.sh -x <vol>.ubi 
   `/dev/ubiX_Y` for UBI).
 - Special or UBI-backed partitions are skipped automatically; naming one explicitly
   still refuses (UBI → use `ubidump`).
+- On block storage, whole-disk LUN aliases (`by-name/sda…` pointing at the entire
+  disk) are filtered so they don't duplicate every partition under them, and the live
+  `userdata`/`data` fs is skipped by default (→ `--files`, or `--force` for a raw image).
 - Unknown NAND partitions are wedge-probed before a full read; a hang aborts the run
   (recover with a ~15 s power long-press, then `--skip` it).
 - Every dump is md5-verified.

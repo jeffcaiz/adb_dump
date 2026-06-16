@@ -24,7 +24,7 @@ device side is one embedded busybox recon script run in a single `adb shell`.
 | **Thin device (few utils)** | exec-out needs ~nothing on-device. If no encoder/exec-out/nc, it **stops with remedies** instead of silently corrupting. `--push-bin <static busybox>` uploads a helper. |
 | **Stripped toolbox (busybox-only utils)** | Old AOSP / Spreadtrum 4.x ship `nc`/`md5sum`/`od`/`uname`/`cut`/… only as busybox applets, with no busybox standalone-shell mode, so unprefixed calls fail and recon comes back empty. On-device busybox applets are auto-detected (`busybox <applet>`) and the coreutils needed by recon are symlinked into a tmp dir prepended to `PATH` — no binary pushed. |
 | **busybox `nc` transport** | The host side reads via a Python socket (no host `nc` needed). busybox `nc -l` often sends the whole file but never `shutdown()`s the socket, so a naive reader blocks forever after the last byte → the read stops on clean EOF *or* a 20 s idle gap (data is all there; md5 verify confirms). Connects are retried because `adb forward` accepts before the device `nc` has bound. |
-| **Root escalation** | `--root auto` = already-root / `adb root` / `su`. Custom: `--root-cmd 'su -c'`. Root check tolerates old toolbox `id -u` that ignores `-u` and prints the full `uid=0(root) …` line. |
+| **Root escalation** | `--root auto` = already-root → **`su`** → `adb root`. `su` is tried *before* `adb root` because on production/Magisk builds `adb root` is refused **and tears down the current adb transport** (next command → `error: closed`, USB re-enumeration can even drop the device to `unauthorized`), which would corrupt the rest of the run when `su` is what's actually available. Custom: `--root-cmd 'su -c'`. Root check tolerates old toolbox `id -u` that ignores `-u` and prints the full `uid=0(root) …` line. |
 | **Busybox quirks** | Strips ANSI colour + PTY `\r`; `</dev/null` so adb shell can't swallow loop stdin. |
 
 ## Storage class drives the plan
@@ -37,7 +37,14 @@ devices. The per-partition plan and hazards branch on it:
   and active-UBI partitions (a raw read can hang the NAND controller), and 1-page
   **wedge-probes** the rest (a hang → abort + 15 s long-press recovery).
 - **eMMC/UFS** skips RPMB, treats `bootX` as separate hw partitions, and does **not**
-  wedge-probe (block reads are safe).
+  wedge-probe (block reads are safe). The live `userdata`/`data` fs is **skipped by
+  default** (a huge, live, FBE/FDE-encrypted raw image is rarely useful) and steered to
+  `--files`; `--force` opts back into a raw image. Whole-disk **LUN aliases** — some
+  devices (seen on OnePlus 6T) expose `by-name/sda…sdf` pointing at the entire disk
+  next to the real partitions — are filtered so a full dump doesn't image the LUN *and*
+  every partition inside it (would have been 238 GB vs 9 GB on the 6T). A whole disk is
+  dropped only when a partition of it is also enumerated, so a partition-table-less raw
+  disk is still kept.
 - **NOR** reads raw safely.
 
 MTD char nodes are **resolved to a node that actually opens**: some platforms (e.g.
@@ -49,8 +56,9 @@ Internally this is an intrinsic `nand_raw_safe` property on each partition rule 
 a match against the human-readable role text), so display wording and dump logic stay
 decoupled.
 
-> The NAND path is validated on hardware; the eMMC/NOR branches are scaffolded and
-> not yet hardware-tested.
+> The NAND and UFS-block paths are validated on hardware (Spreadtrum/Qualcomm NAND;
+> OnePlus 6T SDM845 UFS); the eMMC/NOR branches are scaffolded and not yet
+> hardware-tested.
 
 ### Active UBI
 
@@ -127,6 +135,16 @@ per-file view, so the only inconsistency is per-file (a file written *during* it
 or cross-file (point-in-time skew) — never an unmountable image. Unmounted volumes
 (firmware/NV) have no fs to tar, so they still get a block image even under `--files`.
 On an md5 mismatch in normal (block) mode, the tool points the user at `--files`.
+
+The same mechanism applies to **block storage** (`dump --files`): any mounted block
+partition is captured as a tar of its mountpoint (resolved device→mountpoint from
+`/proc/mounts`), unmounted ones get a block image. This is also the answer to
+**encryption**: under FBE/FDE a raw `userdata` image is ciphertext, but a root tar of
+`/data` reads the tree the kernel has already decrypted — so `userdata`/`data` is
+skipped by default on block and steered here (`--force` overrides to a raw image).
+Caveat: busybox/toybox `tar` has no portable `--one-file-system`, so a submount nested
+under the target (e.g. a tmpfs or a bind under `/data`) is descended into; the run
+warns which submounts it will include.
 
 ## UBI output: flashable, or a self-contained repack kit
 
