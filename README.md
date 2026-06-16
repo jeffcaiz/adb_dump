@@ -36,6 +36,7 @@ Every subcommand has its own `-h` with the options that apply to it.
 --push-bin FILE    push a static busybox/helper for thin devices
 --skip NAME        skip an extra partition (repeatable)
 --freeze MODE      rw-UBI consistency: stop|kill|live   (default stop, see below)
+--retry N          re-read a volume on md5 mismatch (default 2; md5 OK = consistent)
 --files            capture mounted ubifs as a file-level tar.gz (busy rw volumes)
 --no-ubinize       dump/ubidump: keep .ubifs + repack kit, don't build the .ubi
 ```
@@ -52,8 +53,13 @@ GC), tearing the image so it won't parse. `--freeze` picks how hard to quiesce i
 | `live` | nothing | none | reads a moving target |
 
 The default `stop` flushes (`sync`) and pauses the userspace writers reversibly, then
-reads; the device-vs-host md5 check flags any residual tearing. If a volume is busy
-enough that `stop` keeps producing md5 mismatches, escalate to `--freeze kill` — it
+reads; the device-vs-host md5 check flags any residual tearing. On a mismatch it
+**re-reads up to `--retry N` times** (default 2): an md5 match *is* a proof the volume
+held still for the whole read, so if write activity is sporadic a retry usually lands a
+clean point-in-time snapshot — and folding this into one full dump avoids a manual
+single-volume rerun (which won't merge back into the `.ubi`). A volume too big to read
+inside a quiet window (`> --retry-slow` s) is steered to `--files` instead. If a volume is
+busy enough that retries keep mismatching, escalate to `--freeze kill` — it
 **kills the writers and remounts the fs read-only** for a guaranteed-consistent image,
 then **`adb reboot`s the device** (only on a clean run) to restore the killed
 services. Read-only volumes need no quiescing regardless.

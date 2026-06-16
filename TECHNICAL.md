@@ -92,6 +92,16 @@ NAME…` overrides it):
 | `kill` | `kill -9` writers → `mount -o remount,ro` → read → `remount,rw` | clean | no — services killed; auto-`adb reboot` on a clean run |
 | `live` | nothing | none | n/a |
 
+On an md5 mismatch the volume is re-read up to `--retry N` times (default 2). This is
+sound because md5 OK is itself a proof of consistency: the device re-read matching the
+streamed bytes means the volume didn't change across the whole read, so any verified
+read *is* a point-in-time snapshot. Retry just samples again hoping to land a quiet
+window — cheap when writes are sporadic, and it keeps the capture in one full run (a
+manual single-volume rerun can't merge back into the aggregate `.ubi`, and would
+clobber it — so a named subset never rebuilds the `.ubi`). The per-attempt success
+probability falls as the read window (∝ volume size) grows, so a read slower than
+`--retry-slow` (default 180 s) is capped to one retry and pointed at `--files`.
+
 In `kill` mode, if a writer respawns (procd/systemd) before the remount, it swings
 once more, then verifies the mount actually went `ro` in `/proc/mounts`; a mount it
 can't quiesce is flagged and counts as "not clean" (which blocks the auto-reboot).
