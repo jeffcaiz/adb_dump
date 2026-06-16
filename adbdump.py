@@ -1054,22 +1054,37 @@ def dump_ubi_volumes(dev, a, vols, sec, only_names=None):
                 continue
 
             out = os.path.join(a.out, nm + '.ubifs')
-            info(f">> {nm}  ({v})  ->  {out}")
-            if not dev.stream(v, out, a.dd_timeout):
-                err("   transport error"); fail = 1; continue
-            got = os.path.getsize(out)
-            if a.verify:
+            # md5 is the consistency oracle, so retry only helps (and is only safe to
+            # judge) when verifying. Each retry re-reads in the hope of landing a quiet
+            # window. A *slow* read means a huge window that retry is unlikely to beat,
+            # so cap those to one retry and steer to --files. (retry=0 -> 1 attempt.)
+            tries = (a.retry + 1) if a.verify else 1
+            for attempt in range(1, tries + 1):
+                tag = f"   [attempt {attempt}/{tries}]" if attempt > 1 else ""
+                info(f">> {nm}  ({v})  ->  {out}{tag}")
+                t0 = time.monotonic()
+                if not dev.stream(v, out, a.dd_timeout):
+                    err("   transport error"); fail = 1; break
+                read_secs = time.monotonic() - t0
+                got = os.path.getsize(out)
+                if not a.verify:
+                    ok(f"   wrote {hsize(got)}"); dumped.add(nm); break
                 dh, hh = dev.dev_md5(v), host_md5(out)
                 if dh and dh == hh:
-                    ok(f"   md5 OK  {hh}  ({hsize(got)})"); dumped.add(nm)
-                else:
-                    warn(f"   md5 MISMATCH dev={dh} host={hh} (live writes? still inconsistent)")
-                    if mnt:   # a live fs: a torn block image can corrupt the WHOLE ubifs
-                        warn(f"   {C['B']}-> capture it at file level instead (safe for busy volumes):{C['Z']}")
-                        warn(f"      adbdump.py ubidump --files {nm}   (tar {mnt})")
-                    fail = 1
-            else:
-                ok(f"   wrote {hsize(got)}"); dumped.add(nm)
+                    ok(f"   md5 OK  {hh}  ({hsize(got)})"); dumped.add(nm); break
+                slow = read_secs > a.retry_slow
+                last = attempt >= tries or (slow and attempt >= 2)
+                if not last:
+                    warn(f"   md5 MISMATCH (attempt {attempt}/{tries}; live writes?) — retrying…")
+                    continue
+                warn(f"   md5 MISMATCH dev={dh} host={hh} (live writes? still inconsistent)")
+                if slow:
+                    warn(f"   (read took {read_secs:.0f}s > {a.retry_slow}s — window too big to land "
+                         f"a quiet read; not retrying further)")
+                if mnt:   # a live fs: a torn block image can corrupt the WHOLE ubifs
+                    warn(f"   {C['B']}-> capture it at file level instead (safe for busy volumes):{C['Z']}")
+                    warn(f"      adbdump.py ubidump --files {nm}   (tar {mnt})")
+                fail = 1
     finally:
         for mnt in ro_mounts:
             dev.remount(mnt, 'rw')
@@ -1078,8 +1093,15 @@ def dump_ubi_volumes(dev, a, vols, sec, only_names=None):
         if frozen:
             dev.shtext(f"kill -CONT {' '.join(frozen)}")
             info(f"  thawed: {' '.join(frozen)}")
-    if dumped:
+    # Only (re)build the aggregate <mtdname>.ubi for a full selection. A named
+    # subset (e.g. a single `ubidump ubi0_userdata` rerun) would otherwise repack
+    # the .ubi from just that volume and clobber a previously-built complete image.
+    if dumped and not only_names:
         make_flashable(a, sec, dumped)
+    elif dumped and only_names:
+        info(f"  named selection: kept {', '.join(sorted(dumped))} as .ubifs; "
+             f"not rebuilding the aggregate .ubi (flash the volume directly with "
+             f"`ubiupdatevol`, or re-run a full dump to repack)")
     return fail, killed
 
 def reboot_after_kill(dev, killed, fail):
@@ -1188,6 +1210,14 @@ def main():
                           help="rw-UBI consistency: stop=reversible kill -STOP + sync (best-effort, "
                                "md5 catches tearing); kill=kill writers + remount ro (consistent but "
                                "destructive -> auto-reboot on success); live=read live  (default: stop)")
+    readopts.add_argument('--retry', type=int, default=2,
+                          help="on an md5 mismatch (live volume torn mid-read), re-read up to N more "
+                               "times hoping to land a quiet window — md5 OK = a proven point-in-time "
+                               "snapshot (default 2; 0 disables)")
+    readopts.add_argument('--retry-slow', dest='retry_slow', type=int, default=180,
+                          help="a volume whose single read exceeds this many seconds has too big a "
+                               "consistency window for retry to help; cap it to one retry and steer "
+                               "to --files (default 180)")
     readopts.add_argument('--files', action='store_true',
                           help="capture mounted ubifs volumes as a file-level tar(.gz) instead of a "
                                "block image — for busy rw volumes (e.g. userdata) where a torn block "
