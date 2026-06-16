@@ -21,7 +21,7 @@ It adapts: fastest binary-safe transport (exec-out > encoded > nc), root method,
 classifies partitions by platform (Qualcomm-aware) so special ones (mibib/efs2,
 active UBI) are skipped automatically, and finds rw-volume writers dynamically.
 """
-import argparse, base64, gzip, hashlib, os, re, shlex, shutil, subprocess, sys, time
+import argparse, base64, gzip, hashlib, os, re, shlex, shutil, socket, subprocess, sys, time
 from collections import namedtuple
 
 # --------------------------------------------------------------- device recon ---
@@ -46,18 +46,38 @@ echo "BLK=$(for d in /dev/mmcblk0 /dev/sda /dev/nvme0n1; do [ -e $d ] && echo ${
 echo "MMC_TYPE=$(cat /sys/block/mmcblk0/device/type 2>/dev/null)"
 echo "EMMC_SPECIAL=$(for d in /dev/mmcblk0boot0 /dev/mmcblk0boot1 /dev/mmcblk0rpmb /dev/mmcblk0gp0; do [ -e $d ] && echo ${d##*/}; done | tr '\n' ' ')"
 echo "IDU=$(id -u)"
+echo "PROP_HW=$(getprop ro.hardware 2>/dev/null)"
+echo "PROP_BOARD=$(getprop ro.board.platform 2>/dev/null)"
+echo "PROP_MODEL=$(getprop ro.product.model 2>/dev/null)"
+echo "PROP_MFR=$(getprop ro.product.manufacturer 2>/dev/null)"
+echo "PROP_REL=$(getprop ro.build.version.release 2>/dev/null)"
 echo "@APPLETS"
-for a in dd cat base64 openssl xxd gzip md5sum tar nc nanddump busybox flash_erase ubinfo ubiupdatevol stty; do
-  command -v $a >/dev/null 2>&1 && echo "$a=1" || echo "$a=0"
+BB=$(command -v busybox 2>/dev/null)
+for a in dd cat base64 openssl xxd od gzip md5sum tar nc nanddump busybox flash_erase ubinfo ubiupdatevol stty; do
+  if command -v $a >/dev/null 2>&1; then echo "$a=1"
+  elif [ -n "$BB" ] && $BB --list 2>/dev/null | grep -qx "$a"; then echo "$a=bb"
+  else echo "$a=0"; fi
 done
 echo "@DF"
 df -h 2>/dev/null
 echo "@MTD"
 cat /proc/mtd 2>/dev/null
+echo "@MTDDEV"
+# Some platforms (e.g. Spreadtrum) carry stale flat /dev/mtdN nodes whose open()
+# returns ENOENT while the live nodes live under /dev/mtd/mtdN. Resolve each to a
+# node that actually opens — `(: < $p)` opens for read WITHOUT reading any page, so
+# it's safe even on the active-UBI mtd (we never raw-read that one).
+for n in $(sed -n 's/^\(mtd[0-9]*\):.*/\1/p' /proc/mtd 2>/dev/null); do
+  for p in /dev/$n /dev/mtd/$n; do
+    if (: < "$p") 2>/dev/null; then echo "$n $p"; break; fi
+  done
+done
 echo "@MOUNTS"
 grep -i ubifs /proc/mounts 2>/dev/null
 echo "@UBIVOL"
-for v in /dev/ubi[0-9]*_[0-9]*; do
+# volume nodes are named either numerically (ubi0_0) or by name (ubi0_system);
+# `_*` matches both. ubi_ctrl / bare ubi0 lack the ubiN_ prefix so are excluded.
+for v in /dev/ubi[0-9]*_*; do
   [ -e "$v" ] || continue
   n=${v#/dev/}
   echo "$n name=$(cat /sys/class/ubi/$n/name 2>/dev/null)"
@@ -72,7 +92,7 @@ for u in /sys/class/ubi/ubi[0-9]*; do
   for v in ${u}_*; do
     [ -e "$v/name" ] || continue
     vd=${v##*/}
-    echo "VOL $ud $vd id=${vd##*_} type=$(cat $v/type 2>/dev/null) name=$(cat $v/name 2>/dev/null) reserved_ebs=$(cat $v/reserved_ebs 2>/dev/null)"
+    echo "VOL $ud $vd dev=$(cat $v/dev 2>/dev/null) type=$(cat $v/type 2>/dev/null) name=$(cat $v/name 2>/dev/null) reserved_ebs=$(cat $v/reserved_ebs 2>/dev/null)"
   done
 done
 echo "@BLOCK"
@@ -104,6 +124,13 @@ done
 ANSI = re.compile(rb'\x1b\[[0-9;]*[a-zA-Z]')
 def clean(b: bytes) -> str:
     return ANSI.sub(b'', b).replace(b'\r', b'').decode('utf-8', 'replace')
+
+def is_root_uid(s: str) -> bool:
+    """True if `id -u` output indicates uid 0. Old toolbox `id` (Spreadtrum,
+    Android 4.x) ignores -u and prints the full `uid=0(root) gid=0(root)` line,
+    so accept both the bare `0` and the `uid=0(...)` form."""
+    s = (s or '').strip()
+    return s == '0' or bool(re.match(r'uid=0(\D|$)', s))
 
 # ------------------------------------------------------------- classification ---
 # (regex, role, nand_raw_safe) — `role` is a human-readable descriptor of WHAT the
@@ -194,9 +221,11 @@ def storage_class(facts):
 
 def classify_vendor(facts):
     hay = ' '.join(facts.get(k, '') for k in
-                   ('DTCOMPAT', 'SOC_VENDOR', 'SOC_MACHINE', 'SOC_FAMILY', 'HW', 'DTMODEL', 'KREL')).lower()
+                   ('DTCOMPAT', 'SOC_VENDOR', 'SOC_MACHINE', 'SOC_FAMILY', 'HW', 'DTMODEL', 'KREL',
+                    'PROP_HW', 'PROP_BOARD')).lower()
     for vendor, keys in [
         ('Qualcomm', ('qualcomm', 'qcom', 'msm', 'mdm', 'snapdragon', 'apq')),
+        ('Spreadtrum/Unisoc', ('spreadtrum', 'unisoc', 'sprd', 'sc77', 'sc88', 'sc98', 'sc9', 'sp9')),
         ('MediaTek', ('mediatek', 'mt6', 'mt7', 'mt8')),
         ('Rockchip', ('rockchip', 'rk3')),
         ('Allwinner', ('allwinner', 'sun4i', 'sun5i', 'sun7i', 'sun8i', 'sun50i')),
@@ -229,7 +258,7 @@ class Device:
         self.root = a.root          # none|adbroot|su|custom (resolved later for auto)
         self.root_pre = a.root_cmd
         self.devpre = ''            # PATH prefix after --push-bin
-        self.enc = ''; self.gzip = False; self.execout = False
+        self.enc = ''; self.gzip = False; self.gzipcmd = None; self.execout = False
         self.transport = a.transport
         self.ncport = a.ncport
         self.allow_corrupt = a.allow_corrupt
@@ -265,40 +294,74 @@ class Device:
 
     # ---- capability resolution ----
     def resolve_root(self):
-        idu = (self.shtext('id -u', root=False) or '').strip()
-        if idu == '0':
+        if is_root_uid(self.shtext('id -u', root=False)):
             self.root = 'none'; return
         if self.root in ('none', 'su', 'custom'):
             return
         self.adb('root'); self.adb('wait-for-device', timeout=30)
-        idu = (self.shtext('id -u', root=False) or '').strip()
-        if idu == '0':
+        if is_root_uid(self.shtext('id -u', root=False)):
             self.root = 'none'; return
-        if (self.shtext("su -c 'id -u'", root=False) or '').strip() == '0':
+        if is_root_uid(self.shtext("su -c 'id -u'", root=False)):
             self.root = 'su'; return
         self.root = 'none'
         warn("Could not confirm root (id -u != 0); continuing. Use --root-cmd for custom escalation.")
+
+    def ensure_coreutils(self):
+        """Old stripped toolboxes (Spreadtrum/old AOSP) ship many coreutils only
+        as busybox applets AND lack busybox standalone-shell mode, so unprefixed
+        `uname`/`cut`/`sort`/... fail and recon comes back empty. If busybox is
+        present and a sentinel util is missing, symlink the needed applets into a
+        tmp dir and prepend it to PATH for every later device command. Only
+        symlinks are created — no binary is pushed."""
+        if self.devpre:            # --push-bin already set a PATH prefix
+            return
+        bb = (self.shtext('command -v busybox') or '').strip()
+        if not bb or '\n' in bb:
+            return
+        if (self.shtext('command -v uname >/dev/null 2>&1 && echo y') or '').strip() == 'y':
+            return                 # full coreutils already in PATH
+        need = 'uname cut sort tr sed head wc awk printf od md5sum nc stty'
+        for d in ('/data/local/tmp', '/tmp', '/dev'):
+            out = self.shtext(
+                f'B={bb}; D={d}/.adbdump/bin; $B mkdir -p $D 2>/dev/null && test -w $D || exit 0; '
+                f'for a in {need}; do $B --list 2>/dev/null | grep -qx "$a" && $B ln -sf $B $D/$a; done; '
+                f'$D/uname -m >/dev/null 2>&1 && echo "OK $D"') or ''
+            for line in out.splitlines():
+                if line.startswith('OK '):
+                    p = line[3:].strip()
+                    # `export` (not a bare `PATH=x ` prefix) so the PATH reaches
+                    # EVERY segment of a pipeline, not just the first command —
+                    # producers like `tar | gzip | nc` need nc/od found downstream.
+                    self.devpre = f'export PATH={p}:$PATH; '
+                    ok(f"busybox coreutils linked into PATH ({p})")
+                    return
+        warn("busybox present but coreutils could not be linked; recon may be partial")
 
     def detect_execout(self):
         rc, out = self.adb('exec-out', 'echo', 'eok', timeout=20)
         self.execout = (rc == 0 and out.strip() == b'eok')
 
     def detect_codec(self):
-        self.gzip = bool(self.applets.get('gzip'))
-        for e in ('base64', 'openssl', 'xxd'):
-            if self.applets.get(e):
+        self.gzipcmd = self.acmd('gzip')
+        self.gzip = bool(self.gzipcmd)
+        for e in ('base64', 'openssl', 'xxd', 'od'):
+            if self.acmd(e):
                 self.enc = e; break
 
     def choose_transport(self):
         if self.transport != 'auto':
             return
-        if self.execout:      self.transport = 'execout'
-        elif self.enc:        self.transport = 'encoded'
-        elif self.applets.get('nc'): self.transport = 'nc'
-        elif self.allow_corrupt:     self.transport = 'raw'
+        # od hex-encoding is 2x expansion + slow, so it ranks *behind* nc; the
+        # compact encoders (base64/openssl/xxd, ~1.33x) stay ahead of it.
+        compact = self.enc in ('base64', 'openssl', 'xxd')
+        if self.execout:            self.transport = 'execout'
+        elif compact:               self.transport = 'encoded'
+        elif self.acmd('nc'):       self.transport = 'nc'
+        elif self.enc == 'od':      self.transport = 'encoded'
+        elif self.allow_corrupt:    self.transport = 'raw'
         else:
             err("No binary-safe transport on this device:")
-            err(f"  exec-out={self.execout}  encoder=none(base64/openssl/xxd)  nc={bool(self.applets.get('nc'))}")
+            err(f"  exec-out={self.execout}  encoder=none(base64/openssl/xxd/od)  nc={bool(self.acmd('nc'))}")
             err("Fixes: --push-bin <static busybox>  |  --transport nc  |  --allow-corrupt")
             sys.exit(3)
 
@@ -319,7 +382,7 @@ class Device:
         self.shtext(f'chmod 755 {tmp}/{b}')
         if 'busybox' in b:
             self.shtext(f'{tmp}/{b} --install -s {tmp} 2>/dev/null')
-        self.devpre = f'PATH={tmp}:$PATH '
+        self.devpre = f'export PATH={tmp}:$PATH; '   # reaches every pipeline segment
         ok(f"pushed; device PATH now prefers {tmp}")
 
     # ---- recon ----
@@ -335,74 +398,162 @@ class Device:
         for ln in sec.get('KV', []):
             if '=' in ln:
                 k, v = ln.split('=', 1); facts[k] = v
-        self.applets = {ln.split('=')[0]: ln.split('=')[1] == '1'
+        # value is '1' (standalone in PATH), 'bb' (busybox applet), or '0' (absent)
+        self.applets = {ln.split('=')[0]: ln.split('=', 1)[1]
                         for ln in sec.get('APPLETS', []) if '=' in ln}
         return facts, sec
 
-    # ---- transport: emit ascii ----
-    def _emit_cmd(self, dev):
-        rd = f'gzip -c {dev} 2>/dev/null' if self.gzip else f'cat {dev} 2>/dev/null'
-        return {'base64': f'{rd} | base64',
-                'openssl': f'{rd} | openssl base64',
-                'xxd': f'{rd} | xxd -p'}[self.enc]
+    def acmd(self, name):
+        """How to invoke applet `name` on the device, or None if unavailable.
+        '1' -> bare name in PATH; 'bb' -> via on-device busybox."""
+        v = self.applets.get(name)
+        if v == '1': return name
+        if v == 'bb': return f'busybox {name}'
+        return None
 
-    def _decode(self, data: bytes) -> bytes:
+    # ---- transport ----
+    # A "producer" is a device-side shell command that emits raw bytes to stdout
+    # (e.g. `cat /dev/x`, or `tar -cf - -C /data . | gzip`). Every transport just
+    # moves that byte stream to the host; the producers below build the command.
+    def _dev_producer(self, dev):
+        dd = self.acmd('dd'); cat = self.acmd('cat') or 'cat'
+        return (f'{dd} if={dev} bs=131072 2>/dev/null' if dd
+                else f'{cat} {dev} 2>/dev/null')
+
+    def _tar_producer(self, mnt):
+        """File-level capture of a mounted fs as a (gzipped) tar of its subtree.
+        For busy rw volumes where a block image would risk a torn whole-ubifs."""
+        tar = self.acmd('tar') or 'tar'
+        base = f'{tar} -cf - -C {mnt} . 2>/dev/null'
+        return f'{base} | {self.gzipcmd} -c' if self.gzip else base
+
+    def _encode_cmd(self, producer, add_gzip):
+        enc = {'base64':  self.acmd('base64'),
+               'openssl': f"{self.acmd('openssl')} base64",
+               'xxd':     f"{self.acmd('xxd')} -p",
+               'od':      f"{self.acmd('od')} -An -v -tx1"}[self.enc]
+        mid = f' | {self.gzipcmd} -c' if add_gzip else ''
+        return f'{producer}{mid} | {enc}'
+
+    def _decode(self, data: bytes, gunzip: bool) -> bytes:
         data = data.replace(b'\r', b'').replace(b'\n', b'')
-        raw = bytes.fromhex(data.decode()) if self.enc == 'xxd' else base64.b64decode(data)
-        return gzip.decompress(raw) if self.gzip else raw
+        if self.enc in ('xxd', 'od'):          # hex; od emits space-separated bytes
+            raw = bytes.fromhex(data.replace(b' ', b'').decode())
+        else:
+            raw = base64.b64decode(data)
+        return gzip.decompress(raw) if gunzip else raw
 
     def stream(self, dev, outpath, timeout):
-        """Dump whole device -> outpath. Returns True on (transport) success."""
+        """Dump a whole device/volume -> outpath. Returns True on success."""
+        return self.stream_cmd(self._dev_producer(dev), outpath, timeout)
+
+    def stream_cmd(self, producer, outpath, timeout, compressed=False):
+        """Move `producer`'s stdout to outpath via the chosen transport. Returns
+        True on success. compressed=True means the producer already emits final
+        binary (e.g. a gzipped tar): the encoded transport then skips its own
+        gzip/gunzip so the bytes are carried verbatim."""
         if self.transport == 'execout':
-            rd = f'dd if={dev} bs=131072 2>/dev/null' if self.applets.get('dd') else f'cat {dev} 2>/dev/null'
-            rc, data = self.adb('exec-out', self.wrap(rd), timeout=timeout)
+            rc, data = self.adb('exec-out', self.wrap(producer), timeout=timeout)
             if rc != 0:  # None (timeout) or non-zero exit -> don't leave a partial file
                 return False
             with open(outpath, 'wb') as f:
                 f.write(data)
             return True
         if self.transport == 'encoded':
-            rc, data = self._run(self.base + ['shell', self.wrap(self._emit_cmd(dev))], timeout=timeout)
+            cmd = self._encode_cmd(producer, add_gzip=(self.gzip and not compressed))
+            rc, data = self._run(self.base + ['shell', self.wrap(cmd)], timeout=timeout)
             if rc is None: return False
             try:
                 with open(outpath, 'wb') as f:
-                    f.write(self._decode(data))
+                    f.write(self._decode(data, gunzip=(self.gzip and not compressed)))
             except Exception as e:
                 err(f"   decode error: {e}"); return False
             return True
         if self.transport == 'nc':
-            self.adb('forward', f'tcp:{self.ncport}', f'tcp:{self.ncport}')
-            srv = subprocess.Popen(self.base + ['shell', self.wrap(f'nc -l -p {self.ncport} < {dev}')],
-                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            time.sleep(1)
-            try:
-                with open(outpath, 'wb') as f:
-                    p = subprocess.run(['nc', '127.0.0.1', str(self.ncport)], stdout=f, timeout=timeout)
-                rc = p.returncode
-            except subprocess.TimeoutExpired:
-                rc = None
-            srv.terminate()
-            try:
-                srv.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                srv.kill()
-            self.adb('forward', '--remove', f'tcp:{self.ncport}')
-            return rc == 0
+            return self._stream_nc(producer, outpath, timeout)
         if self.transport == 'raw':
-            rc, data = self._run(self.base + ['shell', self.wrap(f'cat {dev}')], timeout=timeout)
+            rc, data = self._run(self.base + ['shell', self.wrap(producer)], timeout=timeout)
             if rc is None: return False
             with open(outpath, 'wb') as f:
                 f.write(data)
             return True
         return False
 
+    def _stream_nc(self, producer, outpath, timeout):
+        """nc transport. The device side is `producer | busybox nc -l -p PORT`;
+        many busybox builds send everything but never shutdown() the socket, so a
+        plain `nc` reader blocks forever after the last byte. We read with a host
+        socket and stop on a clean EOF *or* an idle gap (no bytes for IDLE s) —
+        the data is all there by then; the caller's md5 verify catches truncation.
+        Using a socket (not the host `nc` binary) also drops that host dependency
+        and lets us poll for listener readiness instead of a fixed sleep."""
+        IDLE = 20            # seconds of no data => sender done (or hung-open)
+        self.adb('forward', f'tcp:{self.ncport}', f'tcp:{self.ncport}')
+        srv = subprocess.Popen(self.base + ['shell', self.wrap(f"{producer} | {self.acmd('nc')} -l -p {self.ncport}")],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        got = 0
+        try:
+            # adb (the host-side forward listener) accepts our connect even before the
+            # device `nc -l` has bound, then closes with 0 bytes when it can't reach the
+            # device port yet. The device nc keeps listening (it never saw a connection),
+            # so an empty/instant result just means "not ready" -> retry until data flows.
+            end = time.monotonic() + (timeout or 1800)
+            time.sleep(1)
+            for _ in range(60):
+                if srv.poll() is not None:           # server exited (e.g. bind failed)
+                    break
+                try:
+                    s = socket.create_connection(('127.0.0.1', self.ncport), timeout=5)
+                except OSError:
+                    time.sleep(0.5); continue
+                s.settimeout(IDLE)
+                with open(outpath, 'wb') as f:        # truncate per attempt
+                    while True:
+                        try:
+                            chunk = s.recv(1 << 16)
+                        except socket.timeout:        # idle gap -> assume complete
+                            break
+                        if not chunk:                 # EOF (clean close, or not-ready)
+                            break
+                        f.write(chunk); got += len(chunk)
+                        if time.monotonic() > end:    # overall cap
+                            break
+                s.close()
+                if got > 0 or time.monotonic() > end:
+                    break
+                time.sleep(0.5)                       # empty -> device nc not bound yet
+        finally:
+            srv.terminate()
+            try:
+                srv.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                srv.kill()
+            self.adb('forward', '--remove', f'tcp:{self.ncport}')
+        return got > 0
+
+    def submounts(self, mnt):
+        """Mountpoints nested under mnt — so a file-level tar can warn that it will
+        descend into them (busybox tar has no portable --one-file-system)."""
+        raw = self.shtext('cat /proc/mounts 2>/dev/null') or ''
+        pre = mnt.rstrip('/') + '/'
+        out = []
+        for ln in raw.splitlines():
+            t = ln.split()
+            if len(t) >= 2 and t[1].startswith(pre):
+                out.append(t[1])
+        return out
+
     def dev_md5(self, dev):
-        r = self.shtext(f'md5sum {dev}', timeout=600) or ''
+        md5 = self.acmd('md5sum')
+        if not md5:
+            return ''
+        r = self.shtext(f'{md5} {dev}', timeout=600) or ''
         m = r.split()
         return m[0] if m else ''
 
     def wedge_probe(self, dev, timeout):
-        rd = f'dd if={dev} bs=2048 count=1 2>/dev/null' if self.applets.get('dd') else f'head -c 2048 {dev} 2>/dev/null'
+        dd = self.acmd('dd')
+        rd = f'{dd} if={dev} bs=2048 count=1 2>/dev/null' if dd else f'head -c 2048 {dev} 2>/dev/null'
         rc, _ = self.adb('shell', self.wrap(f'{rd} | wc -c'), timeout=timeout)
         return rc == 0  # False == wedge/timeout/error
 
@@ -437,11 +588,19 @@ def host_md5(path):
     return h.hexdigest()
 
 def parse_mtd(sec):
+    # @MTDDEV maps mtdN -> the node path that actually opens (flat /dev/mtdN can be
+    # a stale ENOENT node; the live one may be /dev/mtd/mtdN). Fall back to /dev/mtdN.
+    devmap = {}
+    for ln in sec.get('MTDDEV', []):
+        t = ln.split()
+        if len(t) >= 2:
+            devmap[t[0]] = t[1]
     out = []
     for ln in sec.get('MTD', []):
         m = re.match(r'(mtd\d+):\s+([0-9a-f]+)\s+([0-9a-f]+)\s+"([^"]*)"', ln)
         if m:
-            out.append((f'/dev/{m.group(1)}', int(m.group(2), 16), m.group(4)))
+            path = devmap.get(m.group(1), f'/dev/{m.group(1)}')
+            out.append((path, int(m.group(2), 16), m.group(4)))
     return out
 
 def parse_block(sec):
@@ -459,7 +618,8 @@ def ubi_mtds(sec):
     return set(x.strip() for x in sec.get('UBIMTD', []) if x.strip())
 
 def is_ubi_backed(dev, umtds):
-    m = re.match(r'/dev/mtd(\d+)$', dev)
+    # match both /dev/mtdN and the resolved /dev/mtd/mtdN form
+    m = re.search(r'mtd(\d+)$', dev)
     return bool(m and m.group(1) in umtds)
 
 # ----------------------------------------------------------------- subcommands ---
@@ -468,6 +628,8 @@ def setup(dev, a):
     dev.resolve_root()
     if a.push_bin:
         dev.push_bin(a.push_bin)
+    else:
+        dev.ensure_coreutils()
     dev.detect_execout()
     info(f"{C['B']}· reading device recon (platform, flash, ubi)…{C['Z']}")
     facts, sec = dev.recon()
@@ -484,9 +646,13 @@ def cmd_probe(dev, a):
 
     hr(); ok('PLATFORM'); hr()
     info(f"  vendor       {vendor}")
-    info(f"  model        {facts.get('DTMODEL') or '?'}")
-    info(f"  soc          machine={facts.get('SOC_MACHINE') or '?'} family={facts.get('SOC_FAMILY') or '?'} "
-         f"soc_id={facts.get('SOC_ID') or '?'} hw={facts.get('SOC_HW') or ''}")
+    model = facts.get('DTMODEL') or facts.get('PROP_MODEL') or '?'
+    if facts.get('PROP_MFR') and facts.get('PROP_MFR') not in model:
+        model = f"{model} ({facts['PROP_MFR']})"
+    info(f"  model        {model}")
+    info(f"  soc          machine={facts.get('SOC_MACHINE') or facts.get('PROP_BOARD') or '?'} "
+         f"family={facts.get('SOC_FAMILY') or '?'} "
+         f"soc_id={facts.get('SOC_ID') or '?'} hw={facts.get('SOC_HW') or facts.get('PROP_HW') or ''}")
     info(f"  compatible   {facts.get('DTCOMPAT') or '?'}")
     info(f"  cpu          {facts.get('CORES','?')}x {cpu} ({facts.get('ARCH','?')}) part={facts.get('CPUPART','?')}")
     info(f"  kernel       {facts.get('KREL','?')}")
@@ -500,7 +666,8 @@ def cmd_probe(dev, a):
     info(f"  chosen       {dev.transport}")
 
     hr(); ok('APPLETS'); hr()
-    info('  ' + '  '.join(f"{k}={'y' if v else '-'}" for k, v in dev.applets.items()))
+    disp = {'1': 'y', 'bb': 'bb', '0': '-'}
+    info('  ' + '  '.join(f"{k}={disp.get(v, '-')}" for k, v in dev.applets.items()))
 
     parts = enum_parts(sk, sec); umtds = ubi_mtds(sec)
     hr(); ok('FLASH MANIFEST'); hr()
@@ -573,6 +740,23 @@ def dump_one_mtd(dev, a, d, sz, nm):
 def ubi_vols_from_sec(sec):
     return ['/dev/' + ln.split()[0] for ln in sec.get('UBIVOL', []) if ln.strip()]
 
+def _ubi_volname(s):
+    """'/dev/ubi0_userdata' or 'ubi0:userdata' -> 'userdata' (both /proc/mounts forms)."""
+    s = s.rsplit('/', 1)[-1]
+    if ':' in s:
+        return s.split(':', 1)[1]
+    m = re.match(r'ubi\d+_(.+)', s)
+    return m.group(1) if m else s
+
+def ubifs_mounts(sec):
+    """-> {volume_name: mountpoint} for mounted ubifs volumes (from /proc/mounts)."""
+    out = {}
+    for ln in sec.get('MOUNTS', []):
+        t = ln.split()
+        if len(t) >= 3 and t[2] == 'ubifs':
+            out[_ubi_volname(t[0])] = t[1]
+    return out
+
 def parse_ubigeo(sec):
     """-> {ubiDev: {mtd,peb,mio,sub,leb,mtdname, vols:[{vd,id,type,name,reserved_ebs}]}}"""
     devs = {}
@@ -585,7 +769,18 @@ def parse_ubigeo(sec):
             devs[t[1]] = {**kv, 'vols': []}
         elif t[0] == 'VOL':
             kv = dict(x.split('=', 1) for x in t[3:] if '=' in x)
-            devs.setdefault(t[1], {'vols': []})['vols'].append({'vd': t[2], **kv})
+            vol = {'vd': t[2], **kv}
+            # numeric vol_id: a UBI volume's char-device minor is vol_id+1. The node
+            # name is unreliable (it can be the volume *name*, e.g. ubi0_cache), so
+            # derive from /sys .../dev (major:minor); fall back to a numeric suffix.
+            dv = kv.get('dev', '')
+            minor = dv.split(':')[1] if ':' in dv else ''
+            suffix = t[2].rsplit('_', 1)[-1]
+            if minor.isdigit():
+                vol['id'] = str(int(minor) - 1)
+            elif suffix.isdigit():
+                vol['id'] = suffix
+            devs.setdefault(t[1], {'vols': []})['vols'].append(vol)
     return devs
 
 REPACK_SH = '''#!/bin/sh
@@ -627,12 +822,29 @@ def make_flashable(a, sec, dumped):
             warn(f"   {mname}: incomplete UBI geometry (peb={peb} mio={mio} leb={leb}); "
                  f"cannot build flashable .ubi — keeping .ubifs")
             continue
+        # ubinize requires a unique integer vol_id per section. Use the resolved id
+        # where valid+unique; otherwise renumber sequentially (avoiding taken ids) so
+        # a missing/colliding id can never abort the build.
+        taken = set()
+        for v in vols:
+            vid = v.get('id')
+            if vid is not None and vid.isdigit() and int(vid) not in taken:
+                v['_vid'] = int(vid)
+            else:
+                nxt = 0
+                while nxt in taken:
+                    nxt += 1
+                v['_vid'] = nxt
+                warn(f"   {mname}/{v.get('name') or v['vd']}: vol_id "
+                     f"{'missing' if vid is None else f'{vid!r} unusable/duplicate'} "
+                     f"-> assigned {nxt}")
+            taken.add(v['_vid'])
         cfg = os.path.join(a.out, f'{mname}.ubinize.cfg')
         with open(cfg, 'w') as f:
             for v in vols:
                 size = int(v.get('reserved_ebs') or 0) * leb
                 f.write(f"[{v.get('name') or v['vd']}]\nmode=ubi\nimage={v['vd']}.ubifs\n"
-                        f"vol_id={v.get('id', '0')}\nvol_type={v.get('type', 'dynamic')}\n"
+                        f"vol_id={v['_vid']}\nvol_type={v.get('type', 'dynamic')}\n"
                         f"vol_name={v.get('name', '')}\nvol_size={size}\n\n")
         cmd = ['ubinize', '-o', f'{mname}.ubi', '-p', peb, '-m', mio]
         if sub and sub != '0':
@@ -779,7 +991,12 @@ def dump_ubi_volumes(dev, a, vols, sec, only_names=None):
                        `mount -o remount,ro` it — genuinely stops ubifs (commit +
                        no bgt/GC), so the read can't tear. DESTRUCTIVE: services are
                        killed and not restarted; caller auto-reboots on a clean run.
-      live           : read live, touch nothing."""
+      live           : read live, touch nothing.
+
+    With a.files set, mounted volumes are captured as a file-level tar(.gz) of the
+    mountpoint instead of a block image — for busy rw volumes where a torn block
+    image risks corrupting the whole ubifs. Unmounted volumes still get a block
+    image. The --freeze mode still applies (quiescing writers improves the tar)."""
     ro_mounts = []   # remounted ro by us -> restore rw in finally
     frozen = []      # --freeze stop: STOPped pids -> CONT in finally
     killed = False   # did we kill writers? (caller decides whether to auto-reboot)
@@ -809,12 +1026,33 @@ def dump_ubi_volumes(dev, a, vols, sec, only_names=None):
             else:
                 warn(f"  could NOT remount {mnt} ro (writer respawned?) — its image may be inconsistent")
                 fail = 1   # not a clean quiesce -> counts as "not smooth" (blocks auto-reboot)
+    mounts = ubifs_mounts(sec)
+    files_mode = getattr(a, 'files', False)
     dumped = set()
     try:
         for v in vols:
             nm = os.path.basename(v)
             if only_names and nm not in only_names and v not in only_names:
                 continue
+            mnt = mounts.get(_ubi_volname(v))
+
+            # --files: file-level tar of a *mounted* volume (immune to whole-image
+            # tearing). Unmounted volumes (firmware/NV) have no fs to tar, so they
+            # still get a block image even under --files.
+            if files_mode and mnt:
+                ext = '.tar.gz' if dev.gzip else '.tar'
+                out = os.path.join(a.out, nm + ext)
+                sm = dev.submounts(mnt)
+                info(f">> {nm}  (files: {mnt})  ->  {out}")
+                if sm:
+                    warn(f"   note: submount(s) under {mnt}: {' '.join(sm)} — tar descends into them")
+                if not dev.stream_cmd(dev._tar_producer(mnt), out, a.dd_timeout, compressed=True):
+                    err("   transport error"); fail = 1; continue
+                got = os.path.getsize(out)
+                ok(f"   wrote {hsize(got)}  {C['B']}(file-level; only per-file/cross-file skew, "
+                   f"no whole-ubifs tear){C['Z']}")
+                continue
+
             out = os.path.join(a.out, nm + '.ubifs')
             info(f">> {nm}  ({v})  ->  {out}")
             if not dev.stream(v, out, a.dd_timeout):
@@ -822,8 +1060,14 @@ def dump_ubi_volumes(dev, a, vols, sec, only_names=None):
             got = os.path.getsize(out)
             if a.verify:
                 dh, hh = dev.dev_md5(v), host_md5(out)
-                if dh and dh == hh: ok(f"   md5 OK  {hh}  ({hsize(got)})"); dumped.add(nm)
-                else: warn(f"   md5 MISMATCH dev={dh} host={hh} (live writes? still inconsistent)"); fail = 1
+                if dh and dh == hh:
+                    ok(f"   md5 OK  {hh}  ({hsize(got)})"); dumped.add(nm)
+                else:
+                    warn(f"   md5 MISMATCH dev={dh} host={hh} (live writes? still inconsistent)")
+                    if mnt:   # a live fs: a torn block image can corrupt the WHOLE ubifs
+                        warn(f"   {C['B']}-> capture it at file level instead (safe for busy volumes):{C['Z']}")
+                        warn(f"      adbdump.py ubidump --files {nm}   (tar {mnt})")
+                    fail = 1
             else:
                 ok(f"   wrote {hsize(got)}"); dumped.add(nm)
     finally:
@@ -913,6 +1157,8 @@ def cmd_ubidump(dev, a):
     fail, killed = dump_ubi_volumes(dev, a, vols, sec, only_names=a.names or None)
     hr()
     (ok if not fail else warn)(f"DONE -> {a.out}")
+    if getattr(a, 'files', False):
+        info(f"Unpack on host:   tar -xzf {a.out}/<vol>.tar.gz -C <dest>")
     info(f"Extract on host:  ubireader_extract_files {a.out}/<vol>.ubi   (or <vol>.ubifs if kept)")
     reboot_after_kill(dev, killed, fail)
     sys.exit(fail)
@@ -942,6 +1188,10 @@ def main():
                           help="rw-UBI consistency: stop=reversible kill -STOP + sync (best-effort, "
                                "md5 catches tearing); kill=kill writers + remount ro (consistent but "
                                "destructive -> auto-reboot on success); live=read live  (default: stop)")
+    readopts.add_argument('--files', action='store_true',
+                          help="capture mounted ubifs volumes as a file-level tar(.gz) instead of a "
+                               "block image — for busy rw volumes (e.g. userdata) where a torn block "
+                               "image can corrupt the whole ubifs; unmounted volumes still get a block image")
     readopts.add_argument('--no-ubinize', dest='no_ubinize', action='store_true', help='keep only .ubifs, do NOT build flashable .ubi')
     readopts.add_argument('--keep-ubifs', dest='keep_ubifs', action='store_true', help='keep the .ubifs after building .ubi (default: remove the duplicate)')
 

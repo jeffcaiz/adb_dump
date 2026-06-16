@@ -20,9 +20,11 @@ device side is one embedded busybox recon script run in a single `adb shell`.
 
 | Concern | Behaviour |
 |---|---|
-| **adbd version** | Fastest binary-safe transport: `exec-out` → `encoded` (`base64`/`openssl`/`xxd`, +`gzip`) → `nc`. Old adbd (no exec-out, PTY mangles binary) auto-uses encoded + host-side CR strip. |
+| **adbd version** | Fastest binary-safe transport: `exec-out` → `encoded` (compact `base64`/`openssl`/`xxd` ahead of `nc`; bulky `od` hex behind it, +`gzip`) → `nc` → `od`. Old adbd (no exec-out, PTY mangles binary) auto-uses encoded + host-side CR strip. |
 | **Thin device (few utils)** | exec-out needs ~nothing on-device. If no encoder/exec-out/nc, it **stops with remedies** instead of silently corrupting. `--push-bin <static busybox>` uploads a helper. |
-| **Root escalation** | `--root auto` = already-root / `adb root` / `su`. Custom: `--root-cmd 'su -c'`. |
+| **Stripped toolbox (busybox-only utils)** | Old AOSP / Spreadtrum 4.x ship `nc`/`md5sum`/`od`/`uname`/`cut`/… only as busybox applets, with no busybox standalone-shell mode, so unprefixed calls fail and recon comes back empty. On-device busybox applets are auto-detected (`busybox <applet>`) and the coreutils needed by recon are symlinked into a tmp dir prepended to `PATH` — no binary pushed. |
+| **busybox `nc` transport** | The host side reads via a Python socket (no host `nc` needed). busybox `nc -l` often sends the whole file but never `shutdown()`s the socket, so a naive reader blocks forever after the last byte → the read stops on clean EOF *or* a 20 s idle gap (data is all there; md5 verify confirms). Connects are retried because `adb forward` accepts before the device `nc` has bound. |
+| **Root escalation** | `--root auto` = already-root / `adb root` / `su`. Custom: `--root-cmd 'su -c'`. Root check tolerates old toolbox `id -u` that ignores `-u` and prints the full `uid=0(root) …` line. |
 | **Busybox quirks** | Strips ANSI colour + PTY `\r`; `</dev/null` so adb shell can't swallow loop stdin. |
 
 ## Storage class drives the plan
@@ -37,6 +39,11 @@ devices. The per-partition plan and hazards branch on it:
 - **eMMC/UFS** skips RPMB, treats `bootX` as separate hw partitions, and does **not**
   wedge-probe (block reads are safe).
 - **NOR** reads raw safely.
+
+MTD char nodes are **resolved to a node that actually opens**: some platforms (e.g.
+Spreadtrum) keep stale flat `/dev/mtdN` nodes whose `open()` returns `ENOENT` while
+the live nodes live under `/dev/mtd/mtdN`. Recon probes each with a read-only open
+(`(: < $p)`, no page read — safe on the active-UBI mtd) and uses the working path.
 
 Internally this is an intrinsic `nand_raw_safe` property on each partition rule (not
 a match against the human-readable role text), so display wording and dump logic stay
@@ -93,6 +100,23 @@ Read-only volumes have no writers → all modes are a no-op for them.
 `fsfreeze` (FIFREEZE) would be the textbook primitive (it quiesces with files still
 open), but busybox usually lacks it and UBIFS freeze support is uncertain, so it's
 not used.
+
+### `--files` — file-level capture when a block image can't be made consistent
+
+For a big, busy rw volume (e.g. `userdata`/`/data`) on a watchdog device, `--freeze
+kill` reboots (killing `system_server` is fatal to the framework) and `--freeze stop`
+can't guarantee a point-in-time block image. Worse, a **block-level smear of UBIFS
+can corrupt the *whole* image**: UBIFS has global structures (master node, the wandering
+index/TNC, the LPT) captured at different instants — unlike an atomic power-cut, recovery
+can't assume a single point in time, so the volume may not mount at all.
+
+`--files` sidesteps this: it captures a **`tar`(`.gz`) of the mountpoint** instead of the
+volume bytes (`tar -cf - -C <mnt> . | gzip`, streamed over the same transport, `compressed`
+so the encoded path doesn't re-gzip). Reading through the live kernel gives a coherent
+per-file view, so the only inconsistency is per-file (a file written *during* its own copy)
+or cross-file (point-in-time skew) — never an unmountable image. Unmounted volumes
+(firmware/NV) have no fs to tar, so they still get a block image even under `--files`.
+On an md5 mismatch in normal (block) mode, the tool points the user at `--files`.
 
 ## UBI output: flashable, or a self-contained repack kit
 

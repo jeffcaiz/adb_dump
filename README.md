@@ -36,6 +36,7 @@ Every subcommand has its own `-h` with the options that apply to it.
 --push-bin FILE    push a static busybox/helper for thin devices
 --skip NAME        skip an extra partition (repeatable)
 --freeze MODE      rw-UBI consistency: stop|kill|live   (default stop, see below)
+--files            capture mounted ubifs as a file-level tar.gz (busy rw volumes)
 --no-ubinize       dump/ubidump: keep .ubifs + repack kit, don't build the .ubi
 ```
 
@@ -56,6 +57,21 @@ enough that `stop` keeps producing md5 mismatches, escalate to `--freeze kill` â
 **kills the writers and remounts the fs read-only** for a guaranteed-consistent image,
 then **`adb reboot`s the device** (only on a clean run) to restore the killed
 services. Read-only volumes need no quiescing regardless.
+
+### Big busy volumes that won't go consistent (`--files`)
+
+On some devices `--freeze kill` just reboots (killing the framework is fatal) and
+`stop` can't pin a huge live `/data`. A torn **block** image of UBIFS can be
+unmountable entirely (its index/master are smeared across time, unlike an atomic
+power-cut). For these, `ubidump --files <vol>` captures a **file-level `tar.gz` of the
+mountpoint** instead â€” read through the live kernel, so the worst case is a single
+mid-write file or cross-file skew, never a dead image. Unmounted volumes (firmware/NV)
+still get a block image. On an md5 mismatch the tool suggests this automatically.
+
+```
+./adbdump.py ubidump --files ubi0_userdata      # -> out/ubi0_userdata.tar.gz
+tar -xzf out/ubi0_userdata.tar.gz -C userdata/  # unpack on host
+```
 
 ## Output
 
